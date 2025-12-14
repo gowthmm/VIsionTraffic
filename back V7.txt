@@ -1,0 +1,491 @@
+import os
+import cv2
+import base64
+import numpy as np
+from flask import Flask, render_template, request, jsonify
+from ultralytics import YOLO
+from collections import Counter
+import threading
+from threading import Thread
+import logging
+import time
+
+app = Flask(__name__)
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Configure logging
+logging.basicConfig(filename='app.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Load YOLO model ONCE
+model = YOLO("yolov8n.pt")
+model_lock = threading.Lock()
+
+# In-memory tracking of processes
+processing_status = {}
+status_lock = threading.Lock()
+
+# Global variable to keep track of the last green signal (for round-robin)
+last_green_signal = None
+green_signal_order = []  # Stores the order so that it can be applied with all conditions
+
+signal_allocation_interval = 1  # seconds #Check every second
+base_green_time = 10  # CHANGED FROM 10 to 20 - base seconds for green light
+min_green_time = 0  # minimum seconds for a green light
+max_green_time = 40  # maximum seconds for a green light
+green_start_time = None  # Keeps track of the start time
+current_green_duration = None  # Duration for current green signal
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    files = request.files.getlist("videos")
+    file_paths = []
+    for file in files:
+        if file.filename:
+            file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+            file.save(file_path)
+            file_paths.append(file_path)
+    return jsonify({"message": "Files uploaded successfully", "files": file_paths})
+
+
+def process_frame_internal(video_path, frame_idx, interval, processor_id):
+    """Processes a single frame from a video."""
+    logging.info(f"Processor {processor_id}: Processing frame {frame_idx} of {video_path}")
+    update_status(processor_id, "Starting", video_path)
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        error_msg = f"Could not open video file: {video_path}"
+        logging.error(error_msg)
+        update_status(processor_id, f"Error: {error_msg}", video_path)
+        return
+
+    try:
+        # Set frame position
+        target_frame = frame_idx * interval
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+
+        ret, frame = cap.read()
+        if not ret:
+            update_status(processor_id, "Complete", video_path)
+            logging.info(f"Processor {processor_id}: Completed processing {video_path}")
+            update_processing_status(processor_id, complete=True)
+            return
+
+        # Process the frame with YOLO (use lock for thread safety)
+        with model_lock:
+            results = model(frame)  # Perform YOLO object detection
+            annotated_frame = results[0].plot()  # Draw detected objects
+
+        # Count objects in the frame
+        detections = [results[0].names[int(cls)] for cls in results[0].boxes.cls]
+        counter = Counter(detections)
+        top_detections = dict(counter.most_common(5))
+
+        # Count vehicles
+        vehicle_types = ["car", "truck", "bus", "motorcycle"]
+        vehicle_count = sum(counter[obj] for obj in vehicle_types if obj in counter)
+
+        # Check for emergency vehicles
+        emergency_vehicle_types = ["ambulance", "fire truck", "police car"]  # Customize this
+        emergency_vehicle_detected = any(obj in counter for obj in emergency_vehicle_types)
+
+        # Convert frame to base64 image
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 75]
+        _, buffer = cv2.imencode('.jpg', annotated_frame, encode_param)
+        frame_base64 = base64.b64encode(buffer).decode('utf-8')
+
+        response_data = {
+            "frame_idx": frame_idx,
+            "image": frame_base64,
+            "objects": top_detections,
+            "vehicles": vehicle_count,
+            "emergency": emergency_vehicle_detected,
+            "actual_frame": target_frame
+        }
+
+        # Update processing with the current frame_data (used by allocation)
+        update_processing_status(processor_id, frame_data=response_data, vehicle_count=vehicle_count,
+                                 emergency=emergency_vehicle_detected)
+        update_status(processor_id, f"Processed frame {frame_idx}", video_path, progress=frame_idx)
+
+        # Check if the process has been post, before actually doing this.
+        if processing_status[processor_id].get("paused", False):
+            logging.info("Pausing processor %s", processor_id)
+            return  # Early exit.
+
+
+    except Exception as e:
+        error_msg = f"Error processing frame: {str(e)}"
+        logging.exception(error_msg)
+        update_status(processor_id, f"Error: {error_msg}", video_path)
+        update_processing_status(processor_id, complete=True, error=error_msg)
+
+    finally:
+        cap.release()  # Ensure release!
+
+
+def update_status(processor_id, status_message, video_path="", progress=None):
+    """Updates the processing status for a given processor."""
+    log_msg = f"Processor {processor_id} ({video_path}): {status_message}"
+    logging.info(log_msg)
+
+
+def update_processing_status(processor_id, **kwargs):
+    """Updates the in-memory processing status dictionary."""
+    global processing_status
+    with status_lock:
+        if processor_id not in processing_status:
+            processing_status[processor_id] = {}
+        processing_status[processor_id].update(kwargs)
+
+
+def calculate_green_duration(vehicle_counts):
+    """Calculate green duration based on vehicle counts."""
+    if not vehicle_counts:
+        return {}
+    
+    total_vehicles = sum(vehicle_counts.values())
+    if total_vehicles == 0:
+        # Equal time for all if no vehicles detected
+        return {pid: base_green_time for pid in vehicle_counts}
+    
+    # Calculate proportional durations with increased sensitivity
+    durations = {}
+    
+    # Define a sensitivity factor - higher means more sensitive to vehicle differences
+    sensitivity_factor = 2.0  # ADDED: Increase sensitivity to vehicle count differences
+    
+    # Find the maximum vehicle count to establish a reference point
+    max_vehicle_count = max(vehicle_counts.values()) if vehicle_counts else 1
+    
+    for pid, count in vehicle_counts.items():
+        # More sensitive formula: uses the square root to enhance sensitivity for small vehicle counts
+        # The formula now gives more time even for small differences in vehicle counts
+        if count == 0:
+            # If no vehicles, give minimum time
+            durations[pid] = min_green_time
+        else:
+            # Enhanced formula to make system sensitive to even small vehicle counts
+            # Uses both linear and logarithmic components for better sensitivity
+            proportion = count / total_vehicles
+            
+            # Calculate base proportional time
+            base_proportional = proportion * base_green_time * len(vehicle_counts)
+            
+            # Add logarithmic component to increase sensitivity
+            log_component = 2 * np.log1p(count) if count > 0 else 0
+            
+            # Final duration
+            duration = base_proportional + log_component
+            
+            # Ensure within bounds
+            durations[pid] = max(min(duration, max_green_time), min_green_time)
+    
+    # Log the detailed calculation
+    logging.info(f"Vehicle counts: {vehicle_counts}")
+    logging.info(f"Calculated durations: {durations}")
+    
+    return durations
+
+
+def allocate_traffic_signals():
+    """Allocates traffic signals based on vehicle counts, emergency status, and round-robin order."""
+    global processing_status, last_green_signal, green_signal_order, green_start_time, current_green_duration
+
+    # Store green durations for each processor
+    green_durations = {}
+
+    while True:
+        try:
+            with status_lock:
+                # Check if we have any active processors
+                active_processors = {pid: status for pid, status in processing_status.items()
+                                     if status.get('processing', False) and not status.get('complete', False)}
+
+                if not active_processors:
+                    time.sleep(signal_allocation_interval)
+                    continue
+
+                # Collect vehicle counts and check for emergencies
+                vehicle_counts = {}
+                emergency_pid = None
+
+                for pid, status in active_processors.items():
+                    # Use the most recent known vehicle count
+                    if 'frame_data' in status and 'vehicles' in status['frame_data']:
+                        vehicle_counts[pid] = status['frame_data']['vehicles']
+                    elif 'vehicle_count' in status:
+                        vehicle_counts[pid] = status['vehicle_count']
+                    elif 'initial_vehicle_count' in status:
+                        vehicle_counts[pid] = status['initial_vehicle_count']
+                    else:
+                        vehicle_counts[pid] = 0
+
+                    # Check for emergency vehicles
+                    if status.get('emergency', False):
+                        emergency_pid = pid
+
+                if not vehicle_counts:
+                    time.sleep(signal_allocation_interval)
+                    continue
+
+                # Calculate proportional green durations based on vehicle counts
+                green_durations = calculate_green_duration(vehicle_counts)
+                logging.info(f"Calculated green durations: {green_durations}")
+
+                # Determine which signal gets green
+                new_green_pid = None
+                current_time = time.time()
+
+                # Priority 1: Emergency vehicle
+                if emergency_pid:
+                    new_green_pid = emergency_pid
+                    current_green_duration = max_green_time  # Give maximum time for emergency
+                    logging.info(f"Emergency vehicle detected on {emergency_pid}, giving green signal")
+
+                # Priority 2: Check if current green signal time has expired
+                elif last_green_signal in vehicle_counts and green_start_time is not None:
+                    time_elapsed = current_time - green_start_time
+                    
+                    # Get the allocated duration for the current green signal
+                    allocated_duration = green_durations.get(last_green_signal, base_green_time)
+                    
+                    if time_elapsed >= allocated_duration:
+                        # FIXED: Implement true round-robin logic using green_signal_order
+                        # Create a list of active processors from green_signal_order maintaining the order
+                        ordered_active_pids = [pid for pid in green_signal_order if pid in active_processors]
+                        
+                        if ordered_active_pids:
+                            # Find current position in the order
+                            if last_green_signal in ordered_active_pids:
+                                current_index = ordered_active_pids.index(last_green_signal)
+                                # Get next processor in round-robin fashion
+                                next_index = (current_index + 1) % len(ordered_active_pids)
+                                new_green_pid = ordered_active_pids[next_index]
+                            else:
+                                # If current signal not in active list, start from the beginning
+                                new_green_pid = ordered_active_pids[0]
+                                
+                        logging.info(f"Green time expired for {last_green_signal} after {time_elapsed:.2f}s, following round-robin to {new_green_pid}")
+                    else:
+                        # Continue with current green signal
+                        new_green_pid = last_green_signal
+                
+                # Priority 3: Initial green signal or after emergency
+                elif vehicle_counts:
+                    # For initial assignment, still pick the first in round-robin order
+                    active_pids_in_order = [pid for pid in green_signal_order if pid in active_processors]
+                    if active_pids_in_order:
+                        new_green_pid = active_pids_in_order[0]  # Start with the first in order
+                    else:
+                        new_green_pid = max(vehicle_counts, key=vehicle_counts.get)
+                    
+                    logging.info(f"Assigning initial green to {new_green_pid} with {vehicle_counts[new_green_pid]} vehicles")
+
+                # Apply signal changes
+                if new_green_pid:
+                    # If switching to a new signal
+                    if new_green_pid != last_green_signal:
+                        # Set the green duration for the new signal
+                        current_green_duration = green_durations.get(new_green_pid, base_green_time)
+                        green_start_time = current_time
+                        
+                        # Update processing status
+                        for pid in vehicle_counts:
+                            if pid == new_green_pid:
+                                processing_status[pid]['signal'] = 'green'
+                                processing_status[pid]['paused'] = False
+                                processing_status[pid]['allocated_time'] = current_green_duration
+                            else:
+                                processing_status[pid]['signal'] = 'red'
+                                
+                        # Log the change
+                        logging.info(f"Green signal assigned to {new_green_pid} for {current_green_duration:.2f}s with {vehicle_counts.get(new_green_pid, 0)} vehicles")
+                        
+                        # Update tracking variables
+                        last_green_signal = new_green_pid
+
+            # Wait before next allocation check
+            time.sleep(signal_allocation_interval)
+
+        except Exception as e:
+            logging.exception(f"Error in traffic signal allocation: {e}")
+            time.sleep(signal_allocation_interval)
+
+
+@app.route('/process_video', methods=['POST'])
+def process_video():
+    """Starts video processing in a separate thread."""
+    global green_signal_order
+
+    data = request.json
+    video_path = data.get('video_path')
+    interval = int(data.get('interval', 10))
+    processor_id = data.get('processor_id')  # Unique ID for the video processor
+
+    if not os.path.exists(video_path):
+        return jsonify({"error": f"Video file not found: {video_path}"}), 404
+
+    # Init the status of this video - CHANGED TO paused=False
+    update_processing_status(processor_id, processing=True, complete=False, signal='red', paused=False)
+    green_signal_order.append(processor_id)  # Add to order to apply
+
+    # Get video info on frame 0
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return jsonify({"error": f"Could not open video file: {video_path}"}), 500
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+
+    update_processing_status(processor_id, total_frames=total_frames, fps=fps)
+
+    # Start processing frames in a thread
+    thread = threading.Thread(target=process_frames_continuous, args=(video_path, interval, processor_id, total_frames))
+    thread.start()  # Don't wait!
+
+    return jsonify({"message": "Video processing started.", "processor_id": processor_id, "total_frames": total_frames, "fps": fps})
+
+
+# Add a new function to process frames continuously
+def process_frames_continuous(video_path, interval, processor_id, total_frames):
+    """Process frames continuously with interval."""
+    logging.info(f"Starting continuous processing for {processor_id}")
+
+    frame_idx = 0
+    while True:
+        # Check if we should stop processing
+        with status_lock:
+            if processor_id not in processing_status or \
+                    processing_status[processor_id].get('complete', False) or \
+                    not processing_status[processor_id].get('processing', True):
+                logging.info(f"Stopping continuous processing for {processor_id}")
+                break
+
+            # Check if processing is paused
+            if processing_status[processor_id].get('paused', False):
+                time.sleep(0.5)  # Sleep briefly and check again
+                continue
+
+        # Process the next frame
+        frame_idx += 1
+        if frame_idx * interval >= total_frames:
+            with status_lock:
+                processing_status[processor_id]['complete'] = True
+                processing_status[processor_id]['processing'] = False
+            logging.info(f"Reached end of video for {processor_id}")
+            break
+
+        process_frame_internal(video_path, frame_idx, interval, processor_id)
+        time.sleep(0.2)  # Small delay between frames to prevent CPU overload
+
+
+@app.route('/get_frame_data/<processor_id>')
+def get_frame_data(processor_id):
+    """Gets the latest frame data for a given processor."""
+    global processing_status
+
+    with status_lock:
+        if processor_id in processing_status:
+            status = processing_status[processor_id]  # Get all the data in the status
+            if status and 'frame_data' in status:
+                frame_data = status['frame_data']
+                frame_data['signal'] = status.get('signal', 'red')  # Add signal to it.
+                frame_data['allocated_time'] = status.get('allocated_time', 0)  # Add allocated time
+                
+                # Calculate remaining time if this is a green signal
+                if status.get('signal', 'red') == 'green' and green_start_time is not None:
+                    elapsed = time.time() - green_start_time
+                    allocated = status.get('allocated_time', base_green_time)
+                    frame_data['remaining_time'] = max(0, allocated - elapsed)
+                
+                return jsonify(frame_data)
+            else:
+                return jsonify({"error": "Frame data not available yet."}), 404
+        else:
+            return jsonify({"error": "Processor not found"}), 404
+
+
+@app.route('/get_processing_status/<processor_id>')
+def get_processing_status(processor_id):
+    """Gets the current processing status for a given processor."""
+    global processing_status
+
+    with status_lock:
+        if processor_id in processing_status:
+            return jsonify(processing_status[processor_id])
+        else:
+            return jsonify({"error": "Processor not found"}), 404
+
+
+# Initial analysis function
+@app.route('/initial_analysis', methods=['POST'])
+def initial_analysis():
+    """Performs initial object detection for a video after upload."""
+    data = request.json
+    video_path = data.get('video_path')
+    processor_id = data.get('processor_id')
+
+    if not os.path.exists(video_path):
+        return jsonify({"error": f"Video file not found: {video_path}"}), 404
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return jsonify({"error": f"Could not open video file: {video_path}"}), 500
+
+    ret, frame = cap.read()  # Get the first frame
+    cap.release()
+
+    if not ret:
+        return jsonify({"error": "Could not read first frame"}), 500
+
+    try:
+        with model_lock:
+            results = model(frame)
+            detections = [results[0].names[int(cls)] for cls in results[0].boxes.cls]
+            counter = Counter(detections)
+            vehicle_count = sum(counter[obj] for obj in ["car", "truck", "bus", "motorcycle"])
+
+        update_processing_status(processor_id, initial_vehicle_count=vehicle_count)  # Store for later.
+        return jsonify({"vehicle_count": vehicle_count})
+
+    except Exception as e:
+        logging.exception(f"Error during initial analysis: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/set_paused/<processor_id>/<paused>')
+def set_paused(processor_id, paused):
+    """Sets whether or not a processing is paused."""
+    try:
+        val = paused.lower() == "true"
+        logging.info("Setting pause state of %s to %s", processor_id, val)
+        with status_lock:
+            if processor_id in processing_status:
+                processing_status[processor_id]["paused"] = val
+                return jsonify({"message": "Successful paused state."})
+            else:
+                return jsonify({"error": "Processor not found"}), 404
+
+    except Exception as e:
+        logging.exception(f"Failure to set paused state: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# Start the traffic signal allocation
+if __name__ == "__main__":
+    # Start the traffic allocation thread
+    signal_thread = threading.Thread(target=allocate_traffic_signals)
+    signal_thread.daemon = True  # Allow the main thread to exit even if this thread is running
+    signal_thread.start()
+
+    app.run(debug=True, host='0.0.0.0', port=5000)
