@@ -229,7 +229,7 @@ def allocate_traffic_signals():
                     else:
                         vehicle_counts[pid] = 0
 
-                    # Check for emergency vehicles
+                    # Check for emergency vehic
                     if status.get('emergency', False):
                         emergency_pid = pid
 
